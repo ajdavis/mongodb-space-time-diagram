@@ -1,9 +1,12 @@
 import datetime
+import logging
 import sys
 from functools import singledispatch
 
 from textx import metamodel_from_str
 import ujson
+
+logging.basicConfig()
 
 grammar = r"""
 Model: lines+=Line;
@@ -12,13 +15,13 @@ Line: JSTestLine | OtherLine;
 
 JSTestLine:
     '[js_test:' js_test_name=ID '] ' timestamp=Timestamp
-    hostID=HostID? message=JsonOrText
+    hostID=HostID? log_msg=JsonOrText
 ;
 
 Timestamp:
     year=/\d{4}/ '-' month=/\d{2}/ '-' day=/\d{2}/ 'T'
     hour=/\d{2}/ ':' minute=/\d{2}/ ':' second=/\d{2}/ '.' millis=/\d{3}/ 
-    '+0000'
+    /[+-]\d{4}/
 ;
 
 HostID: hostType=/d|s|m/ port=INT '|';
@@ -32,25 +35,14 @@ Text: text=/.*$/;
 OtherLine: message=/.*$/;
 """
 
-
-def process_timestamp(obj):
-    return datetime.datetime(
-        int(obj.year), int(obj.month), int(obj.day), int(obj.hour),
-        int(obj.minute), int(obj.second), 1000 * int(obj.millis))
-
-
-def process_json(obj):
-    obj.parsed = ujson.loads(obj.json)
-
-
-obj_processors = {
-    'Timestamp': process_timestamp,
-    'Json': process_json
-}
-
 mm = metamodel_from_str(grammar)
+mm.register_obj_processors({
+    'Timestamp': lambda obj: datetime.datetime(
+        int(obj.year), int(obj.month), int(obj.day), int(obj.hour),
+        int(obj.minute), int(obj.second), 1000 * int(obj.millis)),
+    'Json': lambda obj: ujson.loads(obj.json)
+})
 
-mm.register_obj_processors(obj_processors)
 model = mm.model_from_file(sys.argv[1])
 
 
@@ -65,7 +57,7 @@ def dict_get(dct, *path):
 
 
 @singledispatch
-def process(line, lineno):
+def process(line, lineno) -> None:
     raise ValueError(f'Cannot process line {lineno}: {line}')
 
 
@@ -79,55 +71,42 @@ def process(line, lineno):
 # must be represented in the vector clock (i.e. the host specified in the host
 # capture groups must be one of the hosts in the vector clock).
 @process.register
-def process_jstest_line(line: mm['JSTestLine'], lineno):
-    print(f'process_jstest_line({line})')
-    if line.message.__class__.__name__ == 'Text':
-        print(f'{line.timestamp} {line.message}')
+def process_jstest_line(line: mm['JSTestLine'], lineno) -> None:
+    if not isinstance(line.log_msg, dict):
+        # Not a structured server log.
         return
 
-    msg_id = line.message.parsed['id']
-    # 'Sending heartbeat'.
-    if msg_id == 4615670:
-        source = line.message.parsed['attr']['heartbeatObj']['from']
-        # TODO: Why is source sometimes empty?
-        if not source:
-            return
+    log_msg = line.log_msg
+    if log_msg.get('c') != 'VECCLOCK':
+        # Not the nodeVectorClock log component.
+        return
 
-        source_port = int(source.split(':')[1])
-        assert source_port == line.hostID.port
-        target_port = line.message.parsed['attr']['target'].split(':')[1]
-        print(f'{line.timestamp} Send HB'
-              f' from {source_port} to {target_port}')
-    # 'Received heartbeat request'.
-    elif msg_id == 24095:
-        source = line.message.parsed['attr']['from']
-        if not source:
-            return
+    hostID = getattr(line, 'hostID', None)
+    server_msg = log_msg['attr']['msg']
+    if 'nodeVectorClockForTest' not in server_msg:
+        # TODO: How is this possible?
+        logging.warning(f"nodeVectorClockForTest absent from {server_msg}")
+        return
 
-        source_port = source.split(':')[1]
-        print(f'{line.timestamp} Receive HB'
-              f' from {source_port} to {line.hostID.port}')
-    # 'Generated heartbeat response'.
-    elif msg_id == 24097:
-        source = line.message.parsed['attr']['from']
-        if not source:
-            return
+    node_vector_clock = server_msg['nodeVectorClockForTest']
+    msg_id = log_msg.get('id')
 
-        source_port = source.split(':')[1]
-        print(f'{line.timestamp} Reply to HB'
-              f' from {source_port} to {line.hostID.port}')
-    # 'Received response to heartbeat'.
-    elif msg_id == 4615620:
-        # Yes, the heartbeat reply's source is called 'target'.
-        source = line.message.parsed['attr']['target']
-        source_port = source.split(':')[1]
-        print(f'{line.timestamp} Receive HB reply'
-              f' from {source_port} to {line.hostID.port}')
+    if msg_id == 202007190:
+        # Sending the vector clock with a request or reply.
+        shiviz_event = f'Send {server_msg}'
+    elif msg_id == 202007191:
+        # Receiving the vector clock with a request or reply.
+        shiviz_event = f'Receive {server_msg}'
+    else:
+        return
+
+    print(
+        f'event={shiviz_event}, host={hostID.port}, clock={node_vector_clock}')
 
 
 @process.register
-def process_other_line(line: mm['OtherLine'], lineno):
-    print(line.message)
+def process_other_line(line: mm['OtherLine'], lineno) -> None:
+    pass
 
 
 for i, line in enumerate(model.lines, start=1):
