@@ -99,24 +99,14 @@ def shiviz_events(model) -> Generator[ShiVizEvent, None, None]:
 def read_bf_log(filename):
     model = mm.model_from_file(filename)
 
-    # ShiViz wants all clocks to include all hosts. First get the set of ports.
-    ports = set()
-    for event in shiviz_events(model):
-        ports.add(event.port)
-
     # ShiViz uses the first line of its input file as the matching regex.
-    print(r'event=(?<event>.*?), host=(?<host>.*?), clock=(?<clock>.*)')
+    print(r'(?<host>\S*) (?<clock>{.*})\n(?<event>.*)')
+    # Shiviz uses the second line as the "Multiple executions regular expression
+    # delimiter", leave it blank.
+    print()
 
-    # While the replica set or cluster is spinning up, some hosts will log their
-    # clocks before they receive values from some other hosts. Default missing
-    # hosts' clock hand values to 1 for ShiViz's sake.
-    default_clock = {port: 1 for port in ports}
     for event in shiviz_events(model):
-        clock = default_clock.copy()
-        clock.update(event.clock)
-        print(f"event={event.description},"
-              f" host={event.port},"
-              f" clock={ujson.dumps(clock)}")
+        print(f"{event.port} {ujson.dumps(event.clock)}\n{event.description}")
 
 
 if __name__ == "__main__":
