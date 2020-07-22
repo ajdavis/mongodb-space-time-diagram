@@ -51,12 +51,14 @@ mm.register_obj_processors({
 # clock: The vector clock, in JSON {"host": timestamp} format. The local host
 # must be represented in the vector clock (i.e. the host specified in the host
 # capture groups must be one of the hosts in the vector clock).
+#
+# We use the server request or reply as "event" and the port number for "host".
 class ShiVizEvent:
-    __slots__ = ("description", "host", "clock")
+    __slots__ = ("description", "port", "clock")
 
-    def __init__(self, description, host, clock):
+    def __init__(self, description, port, clock):
         self.description = description
-        self.host = host
+        self.port = port
         self.clock = clock
 
 
@@ -74,7 +76,7 @@ def shiviz_events(model) -> Generator[ShiVizEvent, None, None]:
                 continue
 
             msg_id = log_msg["id"]
-            host = log_msg["attr"]["self"]
+            port = log_msg["attr"]["myPort"]
             node_vector_clock = log_msg["attr"]["nodeVectorClock"]
 
             if msg_id == 202007190:
@@ -89,7 +91,7 @@ def shiviz_events(model) -> Generator[ShiVizEvent, None, None]:
                 )
                 continue
 
-            yield ShiVizEvent(description, host, node_vector_clock)
+            yield ShiVizEvent(description, port, node_vector_clock)
         except Exception:
             logging.exception(f"Processing line {lineno}: {line.log_msg}")
 
@@ -97,20 +99,23 @@ def shiviz_events(model) -> Generator[ShiVizEvent, None, None]:
 def read_bf_log(filename):
     model = mm.model_from_file(filename)
 
-    # ShiViz wants all clocks to include all hosts. First get the set of hosts.
-    hosts = set()
+    # ShiViz wants all clocks to include all hosts. First get the set of ports.
+    ports = set()
     for event in shiviz_events(model):
-        hosts.add(event.host)
+        ports.add(event.port)
 
+    # ShiViz uses the first line of its input file as the matching regex.
     print(r'event=(?<event>.*?), host=(?<host>.*?), clock=(?<clock>.*)')
 
-    # Default missing hosts" clocks to -1.
-    default_clock = {host_id: 1 for host_id in hosts}
+    # While the replica set or cluster is spinning up, some hosts will log their
+    # clocks before they receive values from some other hosts. Default missing
+    # hosts' clock hand values to 1 for ShiViz's sake.
+    default_clock = {port: 1 for port in ports}
     for event in shiviz_events(model):
         clock = default_clock.copy()
         clock.update(event.clock)
         print(f"event={event.description},"
-              f" host={event.host},"
+              f" host={event.port},"
               f" clock={ujson.dumps(clock)}")
 
 
