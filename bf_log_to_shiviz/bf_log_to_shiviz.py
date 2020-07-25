@@ -77,21 +77,23 @@ def shiviz_events(model) -> Generator[ShiVizEvent, None, None]:
 
             msg_id = log_msg["id"]
             port = log_msg["attr"]["myPort"]
-            node_vector_clock = log_msg["attr"]["nodeVectorClock"]
+            clock = log_msg["attr"]["nodeVectorClock"]
 
             if msg_id == 202007190:
                 # Sending the vector clock with a request or reply.
-                description = f"Send {log_msg['attr']['message']}"
+                description = f"Send {ujson.dumps(clock, sort_keys=True)}" \
+                              f" {log_msg['attr']['message']}"
             elif msg_id == 202007191:
                 # Receiving the vector clock with a request or reply.
-                description = f"Receive a node vector clock"
+                description = f"Receive a node vector clock" \
+                              f" {ujson.dumps(clock, sort_keys=True)}"
             else:
                 logging.warning(
                     f'Unexpected log message id in component VECCLOCK: {msg_id}'
                 )
                 continue
 
-            yield ShiVizEvent(description, port, node_vector_clock)
+            yield ShiVizEvent(description, port, clock)
         except Exception:
             logging.exception(f"Processing line {lineno}: {line.log_msg}")
 
