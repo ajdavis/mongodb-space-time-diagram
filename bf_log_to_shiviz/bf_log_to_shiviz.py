@@ -106,7 +106,7 @@ def read_bf_log(filename):
     print()
 
     for event in shiviz_events(model):
-        print(f"{event.port} {ujson.dumps(event.clock)}\n{event.description}")
+        print(f"{event.port} {ujson.dumps(event.clock, sort_keys=True)}\n{event.description}")
 
 
 if __name__ == "__main__":
