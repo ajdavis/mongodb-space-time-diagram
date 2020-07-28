@@ -37,15 +37,22 @@ class Server {
 }
 
 class NetworkMessage {
-  constructor({sourcePort, targetPort, sendTimestamp, receiveTimestamp, body, isRequest} = {}) {
+  constructor({sourcePort, targetPort, sendTimestamp, receiveTimestamp, body, isRequest, messageId, responseTo} = {}) {
     this.sourcePort = sourcePort;
     this.targetPort = targetPort;
     this.sendTimestamp = sendTimestamp;
     this.receiveTimestamp = receiveTimestamp;
     this.body = body;
     this.isRequest = isRequest;
+    this.messageId = messageId;
+    this.responseTo = responseTo;
   }
 }
+
+function portFromRemote(remote) {
+  return parseInt(remote.split(":")[1]);
+}
+
 
 export default class MongoDBLogFile {
   constructor(text) {
@@ -65,52 +72,97 @@ export default class MongoDBLogFile {
       }));
     }
 
-    let wireRequestId2PendingMessage = new Map();
+    // TODO: per-server
+    let messageId2PendingMessage = new Map();
     this.networkMessages = [];
     let pid2server = new Map();
     let port2server = new Map();
     for (const event of events) {
-      try {
-        if (event.logMessageId === 4615611) {
-          // "initAndListen".
-          const server = Server({pid: event.struct.attr.pid, port: event.port});
-          pid2server.set(server.pid, server);
-          port2server.set(server.port, server);
-        } else if (event.logMessageId == 51800) {
-          // "Client metadata". Relies on SERVER-47922.
-          const connectionId = event.struct.ctx; // Like "conn123".
-          const remotePid = parseInt(event.struct.attr.doc.application.pid);
-          // The shell's pid and others aren't in pid2server, only servers are.
-          if (remotePid in pid2server) {
-            const remoteServer = pid2server.get(remotePid);
-            this.port2server.get(event.port).onConnect(connectionId, remoteServer.port);
-          }
-        } else if (event.logMessageId == 202007260) {
-          // "AsyncDBClient::runCommand sending request", custom message Jesse
-          // added in his "space-time-diagram" branch.
-          const remotePort = parseInt(event.struct.attr.remote.split(":")[1]);
-          // Internal id, not the wire protocol requestId.
-          const internalRequestId = event.struct.attr.requestId;
-          const wireRequestId = event.struct.attr.wireRequestId;
-          wireRequestId2PendingMessage.set(wireRequestId, NetworkMessage({
-            sourcePort: event.port,
-            remotePort: remotePort,
-            sendTimestamp: event.timestamp,
-            receiveTimestamp: null,
-            body: event.struct.attr.commandArgs,
-            isRequest: true
-          }));
-        } else if (event.logMessageId == 21965) {
-          // "About to run the command".
-          const wireRequestId = event.struct.attr.requestId;
-          const pendingMessage = wireRequestId2PendingMessage.get(wireRequestId);
-
-          pendingMessage.receiveTimestamp = event.timestamp;
+      if (event.logMessageId === 4615611) {
+        // "initAndListen".
+        const server = new Server({
+          pid: event.struct.attr.pid,
+          port: event.port
+        });
+        pid2server.set(server.pid, server);
+        port2server.set(server.port, server);
+      } else if (event.logMessageId == 51800) {
+        // "Client metadata". Relies on SERVER-47922.
+        const connectionId = event.struct.ctx; // Like "conn123".
+        if (!event.struct.attr.doc.hasOwnProperty("application")) {
+          continue;
         }
-      } catch (exc) {
-        // TODO: display error to user.
-        throw exc;
+        if (!event.struct.attr.doc.application.hasOwnProperty("pid")) {
+          continue;
+        }
+        const remotePid = parseInt(event.struct.attr.doc.application.pid);
+        // The shell's pid and others aren't in pid2server, only servers are.
+        if (pid2server.has(remotePid)) {
+          const remoteServer = pid2server.get(remotePid);
+          port2server.get(event.port).onConnect(connectionId, remoteServer.port);
+        }
+      } else if (event.logMessageId == 202007260) {
+        // "AsyncDBClient::runCommand sending request", custom message Jesse
+        // added in his "space-time-diagram" branch.
+        const remotePort = portFromRemote(event.struct.attr.remote);
+        // This is the wire protocol requestId.
+        const messageId = event.struct.attr.messageId;
+        messageId2PendingMessage.set(messageId, new NetworkMessage({
+          sourcePort: event.port,
+          remotePort: remotePort,
+          sendTimestamp: event.timestamp,
+          receiveTimestamp: null,
+          body: event.struct.attr.commandArgs,
+          isRequest: true,
+          messageId: messageId,
+          responseTo: null
+        }));
+      } else if (event.logMessageId == 202007262) {
+        // "_processMessage replying", custom message Jesse
+        // added in his "space-time-diagram" branch.
+        const server = port2server.get(event.port);
+        const connectionId = event.struct.ctx;
+        if (server.getPortForConnectionId(connectionId) === undefined) {
+          // Not a peer server.
+          continue;
+        }
+        const messageId = event.struct.attr.messageId;
+        messageId2PendingMessage.set(messageId, new NetworkMessage({
+          sourcePort: event.port,
+          remotePort: portFromRemote(event.struct.attr.remote),
+          sendTimestamp: event.timestamp,
+          receiveTimestamp: null,
+          body: null,
+          isRequest: false,
+          messageId: messageId,
+          responseTo: event.struct.attr.responseTo
+        }))
+      } else if (event.logMessageId == 21965) {
+        // "About to run the command".
+        const messageId = event.struct.attr.messageId;
+        const pendingMessage = messageId2PendingMessage.get(messageId);
+        if (messageId === 0 || pendingMessage === undefined) {
+          // Internal command.
+          continue;
+        }
+        pendingMessage.receiveTimestamp = event.timestamp;
+        pendingMessage.targetPort = event.port;
+        this.networkMessages.push(pendingMessage);
+        messageId2PendingMessage.delete(messageId);
+      } else if (event.logMessageId == 202007261) {
+        // "AsyncDBClient::runCommandRequest got reply", custom message Jesse
+        // added in his "space-time-diagram" branch.
+        const remotePort = portFromRemote(event.struct.attr.remote);
+        const messageId = event.struct.attr.messageId;
+        const pendingMessage = messageId2PendingMessage.get(messageId);
+        pendingMessage.receiveTimestamp = event.timestamp;
+        pendingMessage.body = event.struct.attr.response;
+        pendingMessage.targetPort = event.port;
+        this.networkMessages.push(pendingMessage);
+        messageId2PendingMessage.delete(messageId);
       }
     }
+
+    console.log(`${this.networkMessages.length} messages`);
   }
 }
