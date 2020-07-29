@@ -1,7 +1,5 @@
 import {Interactive} from "https://vectorjs.org/index.js";
-import MongoDBLogFile from "./mongodb_space_time/mongodb_log_file.js"
-
-let mongodb_log_file;
+import {MongoDBTrafficRecording, trafficRecordingStructure} from "./mongodb_space_time/mongodb_log_file.js";
 
 let file_input = document.getElementById("file-input");
 
@@ -11,12 +9,9 @@ file_input.addEventListener('click', (e) => {
 });
 
 file_input.addEventListener('change', (e) => {
-  let reader = new FileReader();
-  reader.onload = (e) => {
-    mongodb_log_file = new MongoDBLogFile(reader.result);
-  };
-  reader.readAsText(e.target.files[0]);
-
+  jBinary.load(e.target.files[0], trafficRecordingStructure ).then(function (data) {
+    new MongoDBTrafficRecording(data);
+  });
 });
 
 class Event {

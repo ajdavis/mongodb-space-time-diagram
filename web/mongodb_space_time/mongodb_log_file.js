@@ -1,24 +1,3 @@
-class MongoDBLogEvent {
-  constructor({lineno, hostType, port, struct} = {}) {
-    this.lineno = lineno;
-    this.hostType = hostType;
-    this.port = port;
-    this.struct = JSON.parse(struct);
-    this.logMessageId = this.get('id');
-    const timestampStr = this.get(['t', '$date']);
-    this.timestamp = timestampStr ? Date.parse(timestampStr) : null;
-  }
-
-  get(path, default_ = null) {
-    path = path.split ? path.split('.') : path;
-    let obj = this.struct;
-    for (const key of path) {
-      obj = obj ? obj[key] : null;
-    }
-    return obj ? obj : default_;
-  }
-}
-
 class Server {
   constructor({pid, port} = {}) {
     this.pid = pid;
@@ -76,117 +55,82 @@ function portFromRemote(remote) {
   return parseInt(remote.split(":")[1]);
 }
 
+function bigUint64(view, offset) {
+  const pair = view.getUint64(offset);
+  return BigInt(2 ** 32) * BigInt(pair.hi) + BigInt(pair.lo);
+}
 
-export default class MongoDBLogFile {
-  constructor(text) {
-    let events = [];
-    const pat = /\[js_test:(?<testName>\w+)] \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{4} (?<hostType>[dsm])(?<port>\d+)\| (?<struct>{.*})/;
-    for (const [lineno, line] of text.split("\n").entries()) {
-      const match = pat.exec(line);
-      if (match === null) {
-        continue;
-      }
+function cString(view, offset) {
+  let rv = "";
+  let i = offset;
+  while (view.getChar(i) !== '\0') {
+    rv += view.getChar(i);
+    ++i;
+  }
 
-      events.push(new MongoDBLogEvent({
-        lineno: lineno,
-        hostType: match.groups.hostType,
-        port: parseInt(match.groups.port),
-        struct: match.groups.struct
-      }));
+  return rv;
+}
+
+const trafficRecordingStructure = {
+  'jBinary.littleEndian': true,
+
+  DynamicArray: jBinary.Template({
+    setParams: function (itemType) {
+      this.baseType = {
+        // using built-in type
+        length: 'uint16',
+        // using complex built-in type with simple argument and argument from another field
+        values: ['array', itemType, 'length']
+      };
+    },
+    read: function () {
+      return this.baseRead().values;
+    },
+    write: function (values) {
+      // TODO: remove this method
+      this.baseWrite({
+        length: values.length,
+        values: values
+      });
     }
+  }),
 
+  MessageItem: {
+    length: 'uint32',
+    packetId: 'uint64',
+    source: ['string0'],
+    target: ['string0'],
+    timestamp: 'uint64',
+    packetOrder: 'uint64',
+    packet: 'DynamicArray'
+  },
+
+  // aliasing FileItem[] as type of entire File
+  File: ['array', 'FileItem']
+};
+
+export default class MongoDBTrafficRecording {
+  constructor(data) {
     this.networkMessages = [];
     let pid2server = new Map();
     let port2server = new Map();
-    for (const event of events) {
-      if (event.logMessageId === 4615611) {
-        // "initAndListen".
-        const server = new Server({
-          pid: event.struct.attr.pid,
-          port: event.port
-        });
-        pid2server.set(server.pid, server);
-        port2server.set(server.port, server);
-      } else if (event.logMessageId == 51800) {
-        // "Client metadata". Relies on SERVER-47922.
-        const connectionId = event.struct.ctx; // Like "conn123".
-        if (!event.struct.attr.doc.hasOwnProperty("application")) {
-          continue;
-        }
-        if (!event.struct.attr.doc.application.hasOwnProperty("pid")) {
-          continue;
-        }
-        const remotePid = parseInt(event.struct.attr.doc.application.pid);
-        // The shell's pid and others aren't in pid2server, only servers are.
-        if (pid2server.has(remotePid)) {
-          const remoteServer = pid2server.get(remotePid);
-          port2server.get(event.port).onConnect(connectionId, remoteServer.port);
-        }
-      } else if (event.logMessageId == 202007260) {
-        // "AsyncDBClient::runCommand sending request", custom message Jesse
-        // added in his "space-time-diagram" branch.
-        const recipientPort = portFromRemote(event.struct.attr.remote);
-        // This is the wire protocol requestId.
-        const messageId = event.struct.attr.messageId;
-        const sendingServer = port2server.get(event.port);
-        const networkMessage = new NetworkMessage({
-          sourcePort: event.port,
-          remotePort: recipientPort,
-          sendTimestamp: event.timestamp,
-          receiveTimestamp: null,
-          body: event.struct.attr.commandArgs,
-          isRequest: true,
-          messageId: messageId,
-          responseTo: null
-        });
-        sendingServer.onOutgoingRequest(networkMessage);
-        this.networkMessages.push(networkMessage);
-      } else if (event.logMessageId == 21965) {
-        // "About to run the command", we've received a request.
-        const recipientServer = port2server.get(event.port);
-        const connectionId = event.struct.attr.ctx;
-        const sourcePort = recipientServer.getPortForConnectionId(connectionId);
-        if (sourcePort === undefined) {
-          // The request is coming from a client, not a peer server.
-          continue;
-        }
+    let view = new jDataView(data, 0, data.length, true /* littleEndian */);
 
-        const messageId = event.struct.attr.messageId;
-        const sendingServer = port2server.get(sourcePort);
-        const pendingMessage = sendingServer.popOutgoingRequest(messageId);
-        pendingMessage.receiveTimestamp = event.timestamp;
-      } else if (event.logMessageId == 202007262) {
-        // "_processMessage replying", custom message Jesse
-        // added in his "space-time-diagram" branch.
-        const replyingServer = port2server.get(event.port);
-        const connectionId = event.struct.ctx;
-        if (replyingServer.getPortForConnectionId(connectionId) === undefined) {
-          // The reply is going to a client, not a peer server.
-          continue;
-        }
-        const messageId = event.struct.attr.messageId;
-        const networkMessage = new NetworkMessage({
-          sourcePort: event.port,
-          remotePort: portFromRemote(event.struct.attr.remote),
-          sendTimestamp: event.timestamp,
-          receiveTimestamp: null,
-          body: null,
-          isRequest: false,
-          messageId: messageId,
-          responseTo: event.struct.attr.responseTo
-        });
-        replyingServer.onOutgoingReply(networkMessage);
-        this.networkMessages.push(networkMessage);
-      } else if (event.logMessageId == 202007261) {
-        // "AsyncDBClient::runCommandRequest got reply", custom message Jesse
-        // added in his "space-time-diagram" branch.
-        const remotePort = portFromRemote(event.struct.attr.remote);
-        const messageId = event.struct.attr.messageId;
-        const sendingServer = port2server.get(remotePort);
-        const pendingMessage = sendingServer.popOutgoingReply(messageId);
-        pendingMessage.receiveTimestamp = event.timestamp;
-        pendingMessage.body = event.struct.attr.response;
+    let frameStart = 0;
+    while (true) {
+      let offset = frameStart;
+      const frameSize = view.getUint32(offset);
+      const packetId = bigUint64(view, offset += 4);
+      const source = cString(view, offset += 8);
+      const target = cString(view, offset += source.length + 1);
+      const timestamp = bigUint64(view, offset += target.length + 1);
+      const packetOrder = bigUint64(view, offset += 8);
+      try {
+        const packet = view.getBytes(frameSize - offset + frameStart, offset);
+      } catch (e) {
+        console.log(e);
       }
+      frameStart += frameSize;
     }
 
     console.log(`${this.networkMessages.length} messages`);
