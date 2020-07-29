@@ -25,10 +25,33 @@ class Server {
     this.port = port;
     // Map connection ids like "conn3" to remote servers' listening ports.
     this.connections = new Map();
+    // Map wire protocol messageId to outgoing messages.
+    this.outgoingRequests = new Map();
+    this.outgoingReplies = new Map();
   }
 
   onConnect(connectionId, remoteListeningPort) {
     this.connections.set(connectionId, remoteListeningPort);
+  }
+
+  onOutgoingRequest(networkMessage) {
+    this.outgoingRequests.set(networkMessage.messageId, networkMessage);
+  }
+
+  popOutgoingRequest(messageId) {
+    const networkMessage = this.outgoingRequests.get(messageId);
+    this.outgoingRequests.delete(messageId);
+    return networkMessage;
+  }
+
+  onOutgoingReply(networkMessage) {
+    this.outgoingReplies.set(networkMessage.messageId, networkMessage);
+  }
+
+  popOutgoingReply(messageId) {
+    const networkMessage = this.outgoingReplies.get(messageId);
+    this.outgoingReplies.delete(messageId);
+    return networkMessage;
   }
 
   getPortForConnectionId(connectionId) {
@@ -72,8 +95,6 @@ export default class MongoDBLogFile {
       }));
     }
 
-    // TODO: per-server
-    let messageId2PendingMessage = new Map();
     this.networkMessages = [];
     let pid2server = new Map();
     let port2server = new Map();
@@ -104,30 +125,47 @@ export default class MongoDBLogFile {
       } else if (event.logMessageId == 202007260) {
         // "AsyncDBClient::runCommand sending request", custom message Jesse
         // added in his "space-time-diagram" branch.
-        const remotePort = portFromRemote(event.struct.attr.remote);
+        const recipientPort = portFromRemote(event.struct.attr.remote);
         // This is the wire protocol requestId.
         const messageId = event.struct.attr.messageId;
-        messageId2PendingMessage.set(messageId, new NetworkMessage({
+        const sendingServer = port2server.get(event.port);
+        const networkMessage = new NetworkMessage({
           sourcePort: event.port,
-          remotePort: remotePort,
+          remotePort: recipientPort,
           sendTimestamp: event.timestamp,
           receiveTimestamp: null,
           body: event.struct.attr.commandArgs,
           isRequest: true,
           messageId: messageId,
           responseTo: null
-        }));
+        });
+        sendingServer.onOutgoingRequest(networkMessage);
+        this.networkMessages.push(networkMessage);
+      } else if (event.logMessageId == 21965) {
+        // "About to run the command", we've received a request.
+        const recipientServer = port2server.get(event.port);
+        const connectionId = event.struct.attr.ctx;
+        const sourcePort = recipientServer.getPortForConnectionId(connectionId);
+        if (sourcePort === undefined) {
+          // The request is coming from a client, not a peer server.
+          continue;
+        }
+
+        const messageId = event.struct.attr.messageId;
+        const sendingServer = port2server.get(sourcePort);
+        const pendingMessage = sendingServer.popOutgoingRequest(messageId);
+        pendingMessage.receiveTimestamp = event.timestamp;
       } else if (event.logMessageId == 202007262) {
         // "_processMessage replying", custom message Jesse
         // added in his "space-time-diagram" branch.
-        const server = port2server.get(event.port);
+        const replyingServer = port2server.get(event.port);
         const connectionId = event.struct.ctx;
-        if (server.getPortForConnectionId(connectionId) === undefined) {
-          // Not a peer server.
+        if (replyingServer.getPortForConnectionId(connectionId) === undefined) {
+          // The reply is going to a client, not a peer server.
           continue;
         }
         const messageId = event.struct.attr.messageId;
-        messageId2PendingMessage.set(messageId, new NetworkMessage({
+        const networkMessage = new NetworkMessage({
           sourcePort: event.port,
           remotePort: portFromRemote(event.struct.attr.remote),
           sendTimestamp: event.timestamp,
@@ -136,30 +174,18 @@ export default class MongoDBLogFile {
           isRequest: false,
           messageId: messageId,
           responseTo: event.struct.attr.responseTo
-        }))
-      } else if (event.logMessageId == 21965) {
-        // "About to run the command".
-        const messageId = event.struct.attr.messageId;
-        const pendingMessage = messageId2PendingMessage.get(messageId);
-        if (messageId === 0 || pendingMessage === undefined) {
-          // Internal command.
-          continue;
-        }
-        pendingMessage.receiveTimestamp = event.timestamp;
-        pendingMessage.targetPort = event.port;
-        this.networkMessages.push(pendingMessage);
-        messageId2PendingMessage.delete(messageId);
+        });
+        replyingServer.onOutgoingReply(networkMessage);
+        this.networkMessages.push(networkMessage);
       } else if (event.logMessageId == 202007261) {
         // "AsyncDBClient::runCommandRequest got reply", custom message Jesse
         // added in his "space-time-diagram" branch.
         const remotePort = portFromRemote(event.struct.attr.remote);
         const messageId = event.struct.attr.messageId;
-        const pendingMessage = messageId2PendingMessage.get(messageId);
+        const sendingServer = port2server.get(remotePort);
+        const pendingMessage = sendingServer.popOutgoingReply(messageId);
         pendingMessage.receiveTimestamp = event.timestamp;
         pendingMessage.body = event.struct.attr.response;
-        pendingMessage.targetPort = event.port;
-        this.networkMessages.push(pendingMessage);
-        messageId2PendingMessage.delete(messageId);
       }
     }
 
