@@ -1,9 +1,11 @@
 import heapq
+import io
 import re
 import struct
 from dataclasses import dataclass
 
 import bson
+import snappy
 
 
 @dataclass
@@ -16,6 +18,7 @@ class TrafficRecord:
     remote: str
     timestamp: int
     order: int
+    packet_id: int
     request_id: int
     response_to: int
     message: dict
@@ -88,7 +91,10 @@ def get_traffic_records(file_name):
     unpack_long = struct.Struct("<Q").unpack
     unpack_message_header = struct.Struct("<iiii").unpack
 
-    def unpack_string():
+    def read_remainder():
+        return f.read(msg_len - (f.tell() - message_start))
+
+    def unpack_string(f):
         s = b""
         while True:
             c = f.read(1)
@@ -97,11 +103,49 @@ def get_traffic_records(file_name):
 
             s += c
 
-    def unpack_bson():
-        bson_bytes = f.read(4)
+    def unpack_bson(bio):
+        bson_bytes = bio.read(4)
         bson_length = unpack_int(bson_bytes)[0]
-        bson_bytes += f.read(bson_length - 4)
+        bson_bytes += bio.read(bson_length - 4)
         return bson.decode(bson_bytes)
+
+    def traffic_record_from_op_msg(data):
+        bio = io.BytesIO(data)
+        op_msg_flags = unpack_int(bio.read(4))[0]
+        checksum_present = op_msg_flags & 0x1
+        sections_end = len(data) - (4 if checksum_present else 0)
+
+        body = {}
+
+        while bio.tell() < sections_end:
+            payload_type = unpack_byte(bio.read(1))[0]
+            if payload_type == 0:
+                # Body section.
+                body.update(unpack_bson(bio))
+            else:
+                # Document sequence.
+                assert payload_type == 1
+                section_start = bio.tell()
+                section_size = unpack_int(bio.read(4))[0]
+                sequence_identifier = unpack_string(bio)
+                documents = []
+                while bio.tell() < section_start + section_size:
+                    documents.append(unpack_bson(bio))
+
+                body[sequence_identifier] = documents
+
+        if op_msg_flags & 0x1:
+            checksum = bio.read(4)
+
+        return TrafficRecord(
+            local=local,
+            remote=remote,
+            timestamp=timestamp,
+            order=order,
+            packet_id=packet_id,
+            request_id=request_id,
+            response_to=response_to,
+            message=body)
 
     while True:
         # Traffic record header written by traffic_recorder.cpp.
@@ -112,8 +156,8 @@ def get_traffic_records(file_name):
 
         record_len = unpack_int(record_len_bytes)[0]
         packet_id = unpack_long(f.read(8))[0]
-        local = unpack_string()
-        remote = unpack_string()
+        local = unpack_string(f)
+        remote = unpack_string(f)
         timestamp = unpack_long(f.read(8))[0]
         order = unpack_long(f.read(8))[0]
 
@@ -125,15 +169,16 @@ def get_traffic_records(file_name):
         if op_code == 2004:
             # OP_QUERY.
             flags = unpack_int(f.read(4))[0]
-            ns = unpack_string()
+            ns = unpack_string(f)
             number_to_skip = unpack_int(f.read(4))[0]
             number_to_return = unpack_int(f.read(4))[0]
-            query = bson.decode(f.read(msg_len - (f.tell() - message_start)))
+            query = bson.decode(read_remainder())
             yield TrafficRecord(
                 local=local,
                 remote=remote,
                 timestamp=timestamp,
                 order=order,
+                packet_id=packet_id,
                 request_id=request_id,
                 response_to=response_to,
                 message=query)
@@ -143,55 +188,27 @@ def get_traffic_records(file_name):
             cursor_id = unpack_long(f.read(8))[0]
             starting_from = unpack_int(f.read(4))[0]
             number_returned = unpack_int(f.read(4))[0]
-            reply = bson.decode(f.read(msg_len - (f.tell() - message_start)))
+            reply = bson.decode(read_remainder())
             yield TrafficRecord(
                 local=local,
                 remote=remote,
                 timestamp=timestamp,
                 order=order,
+                packet_id=packet_id,
                 request_id=request_id,
                 response_to=response_to,
                 message=reply)
         elif op_code == 2012:
-            assert False, "TODO: OP_COMPRESSED"
+            compressed_op_code = unpack_int(f.read(4))[0]
+            compressed_length = unpack_int(f.read(4))[0]
+            compressor_id = unpack_byte(f.read(1))[0]
+            data = read_remainder()
+            # TODO: use compressor_id to determine whether it's Snappy or other.
+            op_msg = snappy.uncompress(data)
+            yield traffic_record_from_op_msg(op_msg)
         elif op_code == 2013:
             # OpMsg.
-            flags = unpack_int(f.read(4))[0]
-            checksum_present = flags & 0x1
-            sections_end = (message_start + msg_len
-                            - (4 if checksum_present else 0))
-
-            body = {}
-
-            while f.tell() < sections_end:
-                payload_type = unpack_byte(f.read(1))[0]
-                if payload_type == 0:
-                    # Body section.
-                    body = unpack_bson()
-                else:
-                    # Document sequence.
-                    assert payload_type == 1
-                    assert False, "untested, probably needs work"
-                    section_start = f.tell()
-                    section_size = unpack_int(f.read(4))[0]
-                    sequence_identifier = unpack_string()
-                    documents = []
-                    while f.tell() < section_start + section_size:
-                        documents.append(unpack_bson())
-
-                    body[sequence_identifier] = documents
-
-            if flags & 0x1:
-                checksum = f.read(4)
-
-            yield TrafficRecord(
-                local=local,
-                remote=remote,
-                timestamp=timestamp,
-                order=order,
-                request_id=request_id,
-                response_to=response_to,
-                message=body)
+            yield traffic_record_from_op_msg(f.read(msg_len - 16))
 
 
 def merge_traffic_recordings(*file_names):
@@ -203,15 +220,28 @@ def merge_traffic_recordings(*file_names):
 def main(*file_names):
     # Source of peer connections.
     server_source_ports = set()
-    requests = {}
+    request_id_to_request = {}
+    response_to_id_to_reply = {}
+
+    # Traffic recordings include requests that the server *receives* and the
+    # replies it sends. It omits the server's requests, and replies it receives.
     for record in merge_traffic_recordings(*file_names):
         if record.application_name:
             if (record.application_name.endswith('mongod')
                     or record.application_name.endswith('mongos')):
                 server_source_ports.add(record.remote)
 
-        if record.is_request and record.remote in server_source_ports:
-            requests[record.request_id] = record
+        if record.remote not in server_source_ports:
+            # Request from a non-server.
+            continue
+
+        if record.is_request:
+            request_id_to_request[record.request_id] = record
+        else:
+            response_to_id_to_reply[record.response_to] = record
+
+    for request in request_id_to_request.values():
+        reply = response_to_id_to_reply.get(request.request_id)
 
 
 main('traffic-recorder-20020', 'traffic-recorder-20021')
