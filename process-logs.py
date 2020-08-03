@@ -1,49 +1,104 @@
+import binascii
+import datetime
 import heapq
 import io
-import re
 import struct
 from dataclasses import dataclass
 
 import bson
+import pyshark
 import snappy
+import typing
 
 
 @dataclass
-class TrafficRecord:
-    """One traffic record in a file produced by mongod or mongos.
+class RawMessage:
+    src: str
+    dst: str
+    data: bytes
+    start_timestamp: datetime.datetime
+    end_timestamp: datetime.datetime
 
-    See traffic_recorder.cpp.
-    """
-    local: str
-    remote: str
-    timestamp: int
-    order: int
-    packet_id: int
+
+@dataclass
+class TCPStream:
+    client: str
+    server: str
+    messages: typing.List[RawMessage]
+
+
+def decode_payload(payload):
+    # TODO: can I get the raw data directly?
+    return binascii.unhexlify(payload.replace(':', ''))
+
+
+def get_streams(file_name):
+    """Get TCPStreams from a pcap file."""
+    cap = pyshark.FileCapture(file_name)
+    streams = {}
+    for packet in cap:
+        if not hasattr(packet.tcp, 'payload'):
+            continue
+
+        src = f'{packet.ip.addr}:{packet.tcp.srcport}'
+        dst = f'{packet.ip.dst}:{packet.tcp.dstport}'
+        payload = decode_payload(packet.tcp.payload)
+
+        if packet.tcp.stream not in streams:
+            # Stream's first packet determines which peer is the client/server.
+            message = RawMessage(
+                src,
+                dst,
+                payload,
+                packet.sniff_time,
+                packet.sniff_time)
+            streams[packet.tcp.stream] = TCPStream(src, dst, [message])
+        else:
+            stream = streams[packet.tcp.stream]
+            last_message = stream.messages[-1]
+            if last_message.src == src and last_message.dst == dst:
+                last_message.data += payload
+                last_message.end_timestamp = packet.sniff_time
+            else:
+                stream.messages.append(RawMessage(
+                    src,
+                    dst,
+                    payload,
+                    packet.sniff_time,
+                    packet.sniff_time))
+
+    # TODO: detect when a stream ends, yield and discard it early.
+    yield from streams.values()
+
+
+@dataclass
+class MongoMessage:
+    src: str
+    dst: str
     request_id: int
     response_to: int
-    message: dict
+    body: dict
+    start_timestamp: datetime.datetime
+    end_timestamp: datetime.datetime
+
+    # Filled in by filter_mongo_messages().
+    requester_pid: typing.Optional[int] = None
+    requester_application_name: typing.Optional[str] = None
 
     @property
     def is_request(self):
         # The first requestId and responseTo are 0, use 'ok' for backup.
-        return self.response_to == 0 and 'ok' not in self.message
+        return self.response_to == 0 and 'ok' not in self.body
 
     @property
     def command_name(self):
         if not self.is_request:
             return None
 
-        return next(iter(self.message))
+        return next(iter(self.body))
 
-    @property
-    def application_name(self):
-        if not self.is_request:
-            return None
-
-        return self._safe_get('client.application.name')
-
-    def _safe_get(self, path):
-        doc = self.message
+    def safe_get(self, path):
+        doc = self.body
         for p in path.split('.'):
             if p not in doc:
                 return None
@@ -53,39 +108,8 @@ class TrafficRecord:
         return doc
 
 
-@dataclass
-class Transmission:
-    """The emission and receipt of a network message."""
-    source: str
-    target: str
-    send_timestamp: int
-    recv_timestamp: int
-    is_reply: bool
-    body: dict
-
-
-def get_traffic_records(file_name):
-    """Generate TrafficRecord instances from a traffic recording stream.
-
-    Traffic recording format:
-
-    uint32_t    recordLen; // the length of this record: message+metadata
-    uint64_t    id;        // the transport::Session id
-    cstr        local;     // the local address
-    cstr        remote;    // the remote address
-    uint64_t    date;      // in millis since epoch
-    uint64_t    order;     // always 1?
-    Message     message;   // The on wire encoding
-    """
-    local_port_matches = re.findall(r'\d+', file_name)
-    if len(local_port_matches) != 1:
-        raise ValueError(
-            f"Couldn't determine server port number from file name"
-            f" '{file_name}, it should include exactly one number")
-
-    local_port = local_port_matches[0]
-    f = open(file_name, 'rb')
-
+def get_mongo_messages(file_name):
+    """Generate MongoMessage instances from a pcap file."""
     unpack_byte = struct.Struct("<B").unpack
     unpack_int = struct.Struct("<I").unpack
     unpack_long = struct.Struct("<Q").unpack
@@ -107,9 +131,13 @@ def get_traffic_records(file_name):
         bson_bytes = bio.read(4)
         bson_length = unpack_int(bson_bytes)[0]
         bson_bytes += bio.read(bson_length - 4)
-        return bson.decode(bson_bytes)
+        try:
+            return bson.decode(bson_bytes)
+        except bson.InvalidBSON as exc:
+            # The "electionTime" timestamp is usually out of range.
+            return {'error': str(exc)}
 
-    def traffic_record_from_op_msg(data):
+    def mongo_message_from_op_msg(data):
         bio = io.BytesIO(data)
         op_msg_flags = unpack_int(bio.read(4))[0]
         checksum_present = op_msg_flags & 0x1
@@ -137,111 +165,132 @@ def get_traffic_records(file_name):
         if op_msg_flags & 0x1:
             checksum = bio.read(4)
 
-        return TrafficRecord(
-            local=local,
-            remote=remote,
-            timestamp=timestamp,
-            order=order,
-            packet_id=packet_id,
+        return MongoMessage(
+            src=message.src,
+            dst=message.dst,
             request_id=request_id,
             response_to=response_to,
-            message=body)
+            body=body,
+            start_timestamp=message.start_timestamp,
+            end_timestamp=message.end_timestamp)
 
-    while True:
-        # Traffic record header written by traffic_recorder.cpp.
-        record_len_bytes = f.read(4)
-        if len(record_len_bytes) == 0:
-            # Finished reading the file.
-            return
+    for stream in get_streams(file_name):
+        for message in stream.messages:
+            f = io.BytesIO(message.data)
+            # MongoDB wire protocol.
+            message_start = f.tell()
+            msg_len, request_id, response_to, op_code = unpack_message_header(
+                f.read(16))
 
-        record_len = unpack_int(record_len_bytes)[0]
-        packet_id = unpack_long(f.read(8))[0]
-        local = unpack_string(f)
-        remote = unpack_string(f)
-        timestamp = unpack_long(f.read(8))[0]
-        order = unpack_long(f.read(8))[0]
-
-        # MongoDB wire protocol.
-        message_start = f.tell()
-        msg_len, request_id, response_to, op_code = unpack_message_header(
-            f.read(16))
-
-        if op_code == 2004:
-            # OP_QUERY.
-            flags = unpack_int(f.read(4))[0]
-            ns = unpack_string(f)
-            number_to_skip = unpack_int(f.read(4))[0]
-            number_to_return = unpack_int(f.read(4))[0]
-            query = bson.decode(read_remainder())
-            yield TrafficRecord(
-                local=local,
-                remote=remote,
-                timestamp=timestamp,
-                order=order,
-                packet_id=packet_id,
-                request_id=request_id,
-                response_to=response_to,
-                message=query)
-        elif op_code == 1:
-            # OP_REPLY.
-            flags = unpack_int(f.read(4))[0]
-            cursor_id = unpack_long(f.read(8))[0]
-            starting_from = unpack_int(f.read(4))[0]
-            number_returned = unpack_int(f.read(4))[0]
-            reply = bson.decode(read_remainder())
-            yield TrafficRecord(
-                local=local,
-                remote=remote,
-                timestamp=timestamp,
-                order=order,
-                packet_id=packet_id,
-                request_id=request_id,
-                response_to=response_to,
-                message=reply)
-        elif op_code == 2012:
-            compressed_op_code = unpack_int(f.read(4))[0]
-            compressed_length = unpack_int(f.read(4))[0]
-            compressor_id = unpack_byte(f.read(1))[0]
-            data = read_remainder()
-            # TODO: use compressor_id to determine whether it's Snappy or other.
-            op_msg = snappy.uncompress(data)
-            yield traffic_record_from_op_msg(op_msg)
-        elif op_code == 2013:
-            # OpMsg.
-            yield traffic_record_from_op_msg(f.read(msg_len - 16))
+            if op_code == 2004:
+                # OP_QUERY.
+                flags = unpack_int(f.read(4))[0]
+                ns = unpack_string(f)
+                number_to_skip = unpack_int(f.read(4))[0]
+                number_to_return = unpack_int(f.read(4))[0]
+                query = bson.decode(read_remainder())
+                yield MongoMessage(
+                    src=message.src,
+                    dst=message.dst,
+                    request_id=request_id,
+                    response_to=response_to,
+                    body=query,
+                    start_timestamp=message.start_timestamp,
+                    end_timestamp=message.end_timestamp)
+            elif op_code == 1:
+                # OP_REPLY.
+                flags = unpack_int(f.read(4))[0]
+                cursor_id = unpack_long(f.read(8))[0]
+                starting_from = unpack_int(f.read(4))[0]
+                number_returned = unpack_int(f.read(4))[0]
+                reply = bson.decode(read_remainder())
+                yield MongoMessage(
+                    src=message.src,
+                    dst=message.dst,
+                    request_id=request_id,
+                    response_to=response_to,
+                    body=reply,
+                    start_timestamp=message.start_timestamp,
+                    end_timestamp=message.end_timestamp)
+            elif op_code == 2012:
+                # OP_COMPRESSED.
+                compressed_op_code = unpack_int(f.read(4))[0]
+                compressed_length = unpack_int(f.read(4))[0]
+                compressor_id = unpack_byte(f.read(1))[0]
+                data = read_remainder()
+                # TODO: use compressor_id to determine whether it's Snappy.
+                op_msg = snappy.uncompress(data)
+                yield mongo_message_from_op_msg(op_msg)
+            elif op_code == 2013:
+                # OP_MSG.
+                yield mongo_message_from_op_msg(f.read(msg_len - 16))
 
 
-def merge_traffic_recordings(*file_names):
-    generators = (get_traffic_records(file_name)
+def merge_pcaps(*file_names):
+    """Get MongoMessages sorted by start time from pcap files."""
+    generators = (get_mongo_messages(file_name)
                   for file_name in file_names)
-    return heapq.merge(*generators, key=lambda record: record.timestamp)
+    return heapq.merge(*generators,
+                       key=lambda mongo_message: mongo_message.start_timestamp)
 
 
-def main(*file_names):
-    # Source of peer connections.
-    server_source_ports = set()
-    request_id_to_request = {}
-    response_to_id_to_reply = {}
+def filter_mongo_messages(*file_names):
+    """Generate intra-cluster MongoMessage instances from pcap files."""
+    @dataclass
+    class Client:
+        src: str
+        pid: int
+        application_name: str
+
+    clients = {}
+    # Intra-cluster requests for which we haven't seen a reply.
+    requests = {}
 
     # Traffic recordings include requests that the server *receives* and the
     # replies it sends. It omits the server's requests, and replies it receives.
-    for record in merge_traffic_recordings(*file_names):
-        if record.application_name:
-            if (record.application_name.endswith('mongod')
-                    or record.application_name.endswith('mongos')):
-                server_source_ports.add(record.remote)
+    for mongo_message in merge_pcaps(*file_names):
+        if mongo_message.is_request:
+            application_name = mongo_message.safe_get('client.application.name')
+            pid = mongo_message.safe_get('client.application.pid')
+            if application_name and (
+                application_name.endswith('mongod')
+                or application_name.endswith('mongos')
+            ):
+                # "isMaster" handshake. We'll overwrite if a port's reused.
+                clients[mongo_message.src] = Client(
+                    mongo_message.src, pid, application_name)
 
-        if record.remote not in server_source_ports:
-            # Request from a non-server.
-            continue
+            client = clients.get(mongo_message.src)
+            if not client:
+                # Request from a non-server.
+                continue
 
-        if record.is_request:
-            request_id_to_request[record.request_id] = record
+            mongo_message.requester_pid = client.pid
+            mongo_message.requester_application_name = client.application_name
+            requests[mongo_message.request_id] = mongo_message
+            yield mongo_message
         else:
-            response_to_id_to_reply[record.response_to] = record
+            request = requests.pop(mongo_message.response_to, None)
+            if request is None:
+                # Reply to a non-server.
+                continue
 
-    for request in request_id_to_request.values():
-        reply = response_to_id_to_reply.get(request.request_id)
+            mongo_message.requester_pid = request.requester_pid
+            mongo_message.requester_application_name = \
+                request.requester_application_name
+
+            yield mongo_message
+
+    if requests:
+        print(f'{len(requests)} requests without replies')
 
 
-main('traffic-recorder-20020', 'traffic-recorder-20021')
+def main(*file_names):
+    # TODO: permit file_names to be a mix of .pcap and .log files. Correlate
+    # server pids with listening ports from the log files. Generate mix of
+    # wire messages and log lines.
+    for m in filter_mongo_messages(*file_names):
+        print(m)
+
+
+main('mongo.pcap')
