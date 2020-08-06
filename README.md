@@ -8,24 +8,29 @@ and the ordering of events in a distributed system".
 Instructions
 ------------
 
+Build MongoDB from my fork and branch:
+
+https://github.com/ajdavis/mongo/tree/space-time-diagram-client-metadata
+
 Enable tcpdump on all ports your cluster will use on the local host, e.g.:
 
 ```
-sudo tcpdump -Xs0 -Nnpi lo -w ~/mongo.pcap "port (27017 or 27018 or 27019)"
+sudo tcpdump -Xs0 -Nnpi any -w ~/mongo.pcap "port (27017 or 27018 or 27019)"
 ```
 
 Select some JS test to run:
 
 ```
 python3 buildscripts/resmoke.py run --suites=replica_sets \
-    jstests/replsets/prepare_survives_primary_reconfig_failover.js
+    jstests/replsets/prepare_survives_primary_reconfig_failover.js \
+    > prepare_survives_primary_reconfig_failover.log
 ```
 
-Kill `tcpdump` and run:
+Terminate `tcpdump` with Control-C, then run:
 
 ```
-python3 process-logs.py ~/mongo.pcap out.space-time
+python3 process-logs.py mongo.pcap prepare_survives_primary_reconfig_failover.log > shiviz.txt
 ```
 
-Display the included `web/index.html` with some web server, visit the page,
-click "Choose File", and select the `out.space-time` file you just created.
+Open [ShiViz](https://bestchai.bitbucket.io/shiviz/) and upload the `shiviz.txt`
+you just created.

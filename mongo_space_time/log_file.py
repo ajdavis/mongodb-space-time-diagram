@@ -1,12 +1,10 @@
 import datetime
 import logging
-import sys
-from typing import Generator
+from dataclasses import dataclass
+from typing import Dict, List
 
 from textx import metamodel_from_str
 import ujson
-
-logging.basicConfig()
 
 grammar = r"""
 Model: lines+=Line;
@@ -15,7 +13,7 @@ Line: JSTestLine | OtherLine;
 
 JSTestLine:
     "[js_test:" js_test_name=ID "] " timestamp=Timestamp
-    hostID=/(d|s|m)\d+\|/ log_msg=JsonOrText
+    hostID=HostID log_msg=JsonOrText
 ;
 
 Timestamp:
@@ -23,6 +21,10 @@ Timestamp:
     hour=/\d{2}/ ":" minute=/\d{2}/ ":" second=/\d{2}/ "." millis=/\d{3}/ 
     /[+-]\d{4}/
 ;
+
+HostID: hostType=/d|s|m/ port=Port "|"; 
+
+Port: port=/\d+/;
 
 JsonOrText: Json | Text;
 
@@ -38,32 +40,47 @@ mm.register_obj_processors({
     "Timestamp": lambda obj: datetime.datetime(
         int(obj.year), int(obj.month), int(obj.day), int(obj.hour),
         int(obj.minute), int(obj.second), 1000 * int(obj.millis)),
-    "Json": lambda obj: ujson.loads(obj.json)
+    "Json": lambda obj: ujson.loads(obj.json),
+    "Port": lambda obj: int(obj.port),
 })
 
 
-# https://github.com/DistributedClocks/shiviz/wiki
-# ShiViz parses the log using a user-specified regular expression. The regular
-# expression must contain three capture groups:
-#
-# event: The event message
-# host: The host / process for the event
-# clock: The vector clock, in JSON {"host": timestamp} format. The local host
-# must be represented in the vector clock (i.e. the host specified in the host
-# capture groups must be one of the hosts in the vector clock).
-#
-# We use the server request or reply as "event" and the port number for "host".
-class ShiVizEvent:
-    __slots__ = ("description", "port", "clock")
+@dataclass
+class Server:
+    pid: int
+    port: int
 
-    def __init__(self, description, port, clock):
-        self.description = description
-        self.port = port
-        self.clock = clock
+    def __post_init__(self):
+        # Map connection ids like "conn3" to remote servers' listening ports.
+        self.connections = {}
+
+    def on_connect(self, connection_id, remote_listening_port):
+        self.connections[connection_id] = remote_listening_port
 
 
-def shiviz_events(model) -> Generator[ShiVizEvent, None, None]:
-    for lineno, line in enumerate(model.lines):
+@dataclass
+class LogLine:
+    lineno: int
+    line: mm["JSTestLine"]
+
+
+@dataclass
+class LogFile:
+    lines: List[LogLine]
+    pid_to_server: Dict[int, Server]
+    port_to_server: Dict[int, Server]
+
+    @property
+    def server_ports(self):
+        return self.port_to_server.keys()
+
+
+def parse_log_file(file_name) -> LogFile:
+    lines = []
+    pid_to_server = {}
+    port_to_server = {}
+
+    for lineno, line in enumerate(mm.model_from_file(file_name).lines):
         try:
             if (not isinstance(line, mm["JSTestLine"])
                 or not isinstance(line.log_msg, dict)):
@@ -71,46 +88,28 @@ def shiviz_events(model) -> Generator[ShiVizEvent, None, None]:
                 continue
 
             log_msg = line.log_msg
-            if log_msg.get("c") != "VECCLOCK":
-                # Not the nodeVectorClock log component.
-                continue
-
             msg_id = log_msg["id"]
-            port = log_msg["attr"]["myPort"]
-            clock = log_msg["attr"]["nodeVectorClock"]
+            if msg_id == 4615611:
+                # "initAndListen".
+                server = Server(
+                    log_msg['attr']['pid'],
+                    int(log_msg['attr']['port']))
+                pid_to_server[server.pid] = server
+                port_to_server[server.port] = server
+            elif msg_id == 51800:
+                # "Client metadata". Relies on SERVER-47922.
+                connection_id = log_msg['ctx']  # Like "conn123".
+                remote_pid = int(
+                    log_msg['attr']['doc']['application']['pid'])
 
-            if msg_id == 202007190:
-                # Sending the vector clock with a request or reply.
-                description = f"Send {ujson.dumps(clock, sort_keys=True)}" \
-                              f" {log_msg['attr']['message']}"
-            elif msg_id == 202007191:
-                # Receiving the vector clock with a request or reply.
-                description = f"Receive a node vector clock" \
-                              f" {ujson.dumps(clock, sort_keys=True)}"
-            else:
-                logging.warning(
-                    f'Unexpected log message id in component VECCLOCK: {msg_id}'
-                )
-                continue
+                if remote_pid in pid_to_server:
+                    remote_server = pid_to_server[remote_pid]
+                    server = port_to_server[line.hostID.port]
+                    server.on_connect(
+                        connection_id, remote_server.port)
 
-            yield ShiVizEvent(description, port, clock)
+            lines.append(LogLine(lineno, line))
         except Exception:
             logging.exception(f"Processing line {lineno}: {line.log_msg}")
 
-
-def read_bf_log(filename):
-    model = mm.model_from_file(filename)
-
-    # ShiViz uses the first line of its input file as the matching regex.
-    print(r'(?<host>\S*) (?<clock>{.*})\n(?<event>.*)')
-    # Shiviz uses the second line as the "Multiple executions regular expression
-    # delimiter", leave it blank.
-    print()
-
-    for event in shiviz_events(model):
-        print(f"{event.port} {ujson.dumps(event.clock, sort_keys=True)}\n{event.description}")
-
-
-if __name__ == "__main__":
-    # TODO: argparse.
-    read_bf_log(sys.argv[1])
+    return LogFile(lines, pid_to_server, port_to_server)

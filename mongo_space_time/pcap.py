@@ -4,6 +4,7 @@ import heapq
 import io
 import struct
 from dataclasses import dataclass
+from operator import attrgetter
 
 import bson
 import pyshark
@@ -81,9 +82,20 @@ class MongoMessage:
     start_timestamp: datetime.datetime
     end_timestamp: datetime.datetime
 
+    # Sort by (start_timestamp, clusterTime.time, clusterTime.inc).
+    sort_key: typing.Tuple[datetime.datetime, int, int] = 0, 0, 0
+
     # Filled in by filter_mongo_messages().
     requester_pid: typing.Optional[int] = None
     requester_application_name: typing.Optional[str] = None
+
+    def __post_init__(self):
+        cluster_time = self.body.get('$clusterTime')
+        if cluster_time:
+            op_time = cluster_time['clusterTime']
+            self.sort_key = (self.start_timestamp, op_time.time, op_time.inc)
+        else:
+            self.sort_key = (self.start_timestamp, 0, 0)
 
     @property
     def is_request(self):
@@ -166,8 +178,8 @@ def get_mongo_messages(file_name):
             checksum = bio.read(4)
 
         return MongoMessage(
-            src=message.src,
-            dst=message.dst,
+            src=src_port,
+            dst=dst_port,
             request_id=request_id,
             response_to=response_to,
             body=body,
@@ -176,6 +188,9 @@ def get_mongo_messages(file_name):
 
     for stream in get_streams(file_name):
         for message in stream.messages:
+            src_port = int(message.src.split(':')[-1])
+            dst_port = int(message.dst.split(':')[-1])
+
             f = io.BytesIO(message.data)
             # MongoDB wire protocol.
             message_start = f.tell()
@@ -190,8 +205,8 @@ def get_mongo_messages(file_name):
                 number_to_return = unpack_int(f.read(4))[0]
                 query = bson.decode(read_remainder())
                 yield MongoMessage(
-                    src=message.src,
-                    dst=message.dst,
+                    src=src_port,
+                    dst=dst_port,
                     request_id=request_id,
                     response_to=response_to,
                     body=query,
@@ -205,8 +220,8 @@ def get_mongo_messages(file_name):
                 number_returned = unpack_int(f.read(4))[0]
                 reply = bson.decode(read_remainder())
                 yield MongoMessage(
-                    src=message.src,
-                    dst=message.dst,
+                    src=src_port,
+                    dst=dst_port,
                     request_id=request_id,
                     response_to=response_to,
                     body=reply,
@@ -227,14 +242,14 @@ def get_mongo_messages(file_name):
 
 
 def merge_pcaps(*file_names):
-    """Get MongoMessages sorted by start time from pcap files."""
+    """Get MongoMessages sorted by start time, clusterTime from pcap files."""
     generators = (get_mongo_messages(file_name)
                   for file_name in file_names)
-    return heapq.merge(*generators,
-                       key=lambda mongo_message: mongo_message.start_timestamp)
+
+    return heapq.merge(*generators, key=attrgetter('sort_key'))
 
 
-def filter_mongo_messages(*file_names):
+def parse_pcap_files(*file_names):
     """Generate intra-cluster MongoMessage instances from pcap files."""
     @dataclass
     class Client:
@@ -258,7 +273,7 @@ def filter_mongo_messages(*file_names):
             ):
                 # "isMaster" handshake. We'll overwrite if a port's reused.
                 clients[mongo_message.src] = Client(
-                    mongo_message.src, pid, application_name)
+                    mongo_message.src, int(pid), application_name)
 
             client = clients.get(mongo_message.src)
             if not client:
@@ -283,14 +298,3 @@ def filter_mongo_messages(*file_names):
 
     if requests:
         print(f'{len(requests)} requests without replies')
-
-
-def main(*file_names):
-    # TODO: permit file_names to be a mix of .pcap and .log files. Correlate
-    # server pids with listening ports from the log files. Generate mix of
-    # wire messages and log lines.
-    for m in filter_mongo_messages(*file_names):
-        print(m)
-
-
-main('mongo.pcap')
